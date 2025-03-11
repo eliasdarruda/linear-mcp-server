@@ -207,7 +207,7 @@ class LinearMCPClient {
     };
   }
 
-  private addMetricsToResponse(response: any) {
+  private addMetricsToResource(response: any) {
     const metrics = this.rateLimiter.getMetrics();
     return {
       ...response,
@@ -222,6 +222,11 @@ class LinearMCPClient {
         }
       }
     };
+  }
+
+  getMetricsText(): string {
+    const metrics = this.rateLimiter.getMetrics();
+    return `\n\nAPI Metrics:\n- Requests in last hour: ${metrics.requestsInLastHour}\n- Remaining requests: ${this.rateLimiter.requestsPerHour - metrics.requestsInLastHour}\n- Average request time: ${Math.round(metrics.averageRequestTime)}ms\n- Queue length: ${metrics.queueLength}`;
   }
 
   async listIssues() {
@@ -255,7 +260,7 @@ class LinearMCPClient {
       'getIssueDetails'
     );
 
-    return this.addMetricsToResponse(issuesWithDetails);
+    return this.addMetricsToResource(issuesWithDetails);
   }
 
   async getIssue(issueId: string) {
@@ -264,7 +269,7 @@ class LinearMCPClient {
 
     const details = await this.getIssueDetails(result);
 
-    return this.addMetricsToResponse({
+    return this.addMetricsToResource({
       id: result.id,
       identifier: result.identifier,
       title: result.title,
@@ -337,7 +342,7 @@ class LinearMCPClient {
       };
     });
 
-    return this.addMetricsToResponse(issuesWithDetails);
+    return this.addMetricsToResource(issuesWithDetails);
   }
 
   async getUserIssues(args: GetUserIssuesArgs) {
@@ -352,7 +357,7 @@ class LinearMCPClient {
       }));
 
       if (!result?.nodes) {
-        return this.addMetricsToResponse([]);
+        return this.addMetricsToResource([]);
       }
 
       const issuesWithDetails = await this.rateLimiter.batch(
@@ -373,7 +378,7 @@ class LinearMCPClient {
         'getUserIssues'
       );
 
-      return this.addMetricsToResponse(issuesWithDetails);
+      return this.addMetricsToResource(issuesWithDetails);
     } catch (error) {
       console.error(`Error in getUserIssues: ${error}`);
       throw error;
@@ -425,7 +430,7 @@ class LinearMCPClient {
       };
     });
 
-    return this.addMetricsToResponse(issuesWithDetails);
+    return this.addMetricsToResource(issuesWithDetails);
   }
 
   async getViewer() {
@@ -435,7 +440,7 @@ class LinearMCPClient {
       this.client.organization
     ]);
 
-    return this.addMetricsToResponse({
+    return this.addMetricsToResource({
       id: viewer.id,
       name: viewer.name,
       email: viewer.email,
@@ -460,7 +465,7 @@ class LinearMCPClient {
       organization.users()
     ]);
 
-    return this.addMetricsToResponse({
+    return this.addMetricsToResource({
       id: organization.id,
       name: organization.name,
       urlKey: organization.urlKey,
@@ -750,15 +755,6 @@ Resource patterns:
 The server uses the authenticated user's permissions for all operations.`
 };
 
-interface MCPMetricsResponse {
-  apiMetrics: {
-    requestsInLastHour: number;
-    remainingRequests: number;
-    averageRequestTime: string;
-    queueLength: number;
-  }
-}
-
 // Zod schemas for tool argument validation
 const CreateIssueArgsSchema = z.object({
   title: z.string().describe("Issue title"),
@@ -943,24 +939,16 @@ async function main() {
 
         metrics = linearClient.rateLimiter.getMetrics();
 
-        const baseResponse: MCPMetricsResponse = {
-          apiMetrics: {
-            requestsInLastHour: metrics.requestsInLastHour,
-            remainingRequests: linearClient.rateLimiter.requestsPerHour - metrics.requestsInLastHour,
-            averageRequestTime: `${Math.round(metrics.averageRequestTime)}ms`,
-            queueLength: metrics.queueLength
-          }
-        };
-
         switch (name) {
           case "linear_create_issue": {
             const validatedArgs = CreateIssueArgsSchema.parse(args);
             const issue = await linearClient.createIssue(validatedArgs);
+            const metricsText = linearClient.getMetricsText();
+            
             return {
               content: [{
                 type: "text",
-                text: `Created issue ${issue.identifier}: ${issue.title}\nURL: ${issue.url}`,
-                metadata: baseResponse
+                text: `Created issue ${issue.identifier}: ${issue.title}\nURL: ${issue.url}${metricsText}`
               }]
             };
           }
@@ -968,11 +956,12 @@ async function main() {
           case "linear_update_issue": {
             const validatedArgs = UpdateIssueArgsSchema.parse(args);
             const issue = await linearClient.updateIssue(validatedArgs);
+            const metricsText = linearClient.getMetricsText();
+            
             return {
               content: [{
                 type: "text",
-                text: `Updated issue ${issue.identifier}\nURL: ${issue.url}`,
-                metadata: baseResponse
+                text: `Updated issue ${issue.identifier}\nURL: ${issue.url}${metricsText}`
               }]
             };
           }
@@ -980,6 +969,8 @@ async function main() {
           case "linear_search_issues": {
             const validatedArgs = SearchIssuesArgsSchema.parse(args);
             const issues = await linearClient.searchIssues(validatedArgs);
+            const metricsText = linearClient.getMetricsText();
+            
             return {
               content: [{
                 type: "text",
@@ -987,8 +978,7 @@ async function main() {
                   issues.map((issue: LinearIssueResponse) =>
                     `- ${issue.identifier}: ${issue.title}\n  Priority: ${issue.priority || 'None'}\n  Status: ${issue.status || 'None'}\n  ${issue.url}`
                   ).join('\n')
-                }`,
-                metadata: baseResponse
+                }${metricsText}`
               }]
             };
           }
@@ -996,6 +986,7 @@ async function main() {
           case "linear_get_user_issues": {
             const validatedArgs = GetUserIssuesArgsSchema.parse(args);
             const issues = await linearClient.getUserIssues(validatedArgs);
+            const metricsText = linearClient.getMetricsText();
 
             return {
               content: [{
@@ -1004,8 +995,7 @@ async function main() {
                   issues.map((issue: LinearIssueResponse) =>
                     `- ${issue.identifier}: ${issue.title}\n  Priority: ${issue.priority || 'None'}\n  Status: ${issue.stateName}\n  ${issue.url}`
                   ).join('\n')
-                }`,
-                metadata: baseResponse
+                }${metricsText}`
               }]
             };
           }
@@ -1013,12 +1003,12 @@ async function main() {
           case "linear_add_comment": {
             const validatedArgs = AddCommentArgsSchema.parse(args);
             const { comment, issue } = await linearClient.addComment(validatedArgs);
+            const metricsText = linearClient.getMetricsText();
 
             return {
               content: [{
                 type: "text",
-                text: `Added comment to issue ${issue?.identifier}\nURL: ${comment.url}`,
-                metadata: baseResponse
+                text: `Added comment to issue ${issue?.identifier}\nURL: ${comment.url}${metricsText}`
               }]
             };
           }
@@ -1028,15 +1018,6 @@ async function main() {
         }
       } catch (error) {
         console.error("Error executing tool:", error);
-
-        const errorResponse: MCPMetricsResponse = {
-          apiMetrics: {
-            requestsInLastHour: metrics.requestsInLastHour,
-            remainingRequests: linearClient.rateLimiter.requestsPerHour - metrics.requestsInLastHour,
-            averageRequestTime: `${Math.round(metrics.averageRequestTime)}ms`,
-            queueLength: metrics.queueLength
-          }
-        };
 
         // If it's a Zod error, format it nicely
         if (error instanceof z.ZodError) {
@@ -1049,17 +1030,13 @@ async function main() {
           return {
             content: [{
               type: "text",
-              text: {
+              text: JSON.stringify({
                 error: {
                   type: 'VALIDATION_ERROR',
                   message: 'Invalid request parameters',
                   details: formattedErrors
                 }
-              },
-              metadata: {
-                error: true,
-                ...errorResponse
-              }
+              }, null, 2)
             }]
           };
         }
@@ -1069,7 +1046,7 @@ async function main() {
           return {
             content: [{
               type: "text",
-              text: {
+              text: JSON.stringify({
                 error: {
                   type: 'API_ERROR',
                   message: error.message,
@@ -1080,11 +1057,7 @@ async function main() {
                     data: error.response?.data
                   }
                 }
-              },
-              metadata: {
-                error: true,
-                ...errorResponse
-              }
+              }, null, 2)
             }]
           };
         }
@@ -1093,16 +1066,12 @@ async function main() {
         return {
           content: [{
             type: "text",
-            text: {
+            text: JSON.stringify({
               error: {
                 type: 'UNKNOWN_ERROR',
                 message: error instanceof Error ? error.message : String(error)
               }
-            },
-            metadata: {
-              error: true,
-              ...errorResponse
-            }
+            }, null, 2)
           }]
         };
       }
