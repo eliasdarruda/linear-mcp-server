@@ -77,6 +77,34 @@ interface LinearIssueResponse {
   url: string;
 }
 
+interface GetTeamsArgs {
+  includeArchived?: boolean;
+}
+
+interface TeamResponse {
+  id: string;
+  name: string;
+  key: string;
+  description?: string;
+  active: boolean;
+}
+
+interface UserResponse {
+  id: string;
+  name: string;
+  email: string;
+  admin: boolean;
+  active: boolean;
+}
+
+interface OrganizationResponse {
+  id: string;
+  name: string;
+  urlKey: string;
+  teams: TeamResponse[];
+  users: UserResponse[];
+}
+
 class RateLimiter {
   public readonly requestsPerHour = 1400;
   private queue: (() => Promise<any>)[] = [];
@@ -188,22 +216,38 @@ class LinearMCPClient {
   }
 
   private async getIssueDetails(issue: Issue) {
-    const [statePromise, assigneePromise, teamPromise] = [
-      issue.state,
-      issue.assignee,
-      issue.team
-    ];
+    // Use a single GraphQL query to fetch issue details in one request
+    const query = `
+      query IssueDetails($issueId: ID!) {
+        issue(id: $issueId) {
+          state {
+            id
+            name
+          }
+          assignee {
+            id
+            name
+          }
+          team {
+            id
+            name
+            key
+          }
+        }
+      }
+    `;
 
-    const [state, assignee, team] = await Promise.all([
-      this.rateLimiter.enqueue(async () => statePromise ? await statePromise : null),
-      this.rateLimiter.enqueue(async () => assigneePromise ? await assigneePromise : null),
-      this.rateLimiter.enqueue(async () => teamPromise ? await teamPromise : null)
-    ]);
+    const result = await this.rateLimiter.enqueue(() => 
+      this.client.client.rawRequest(query, { issueId: issue.id }),
+      'getIssueDetails'
+    );
 
+    const data = result?.data as any;
+    const issueDetails = data?.issue;
     return {
-      state,
-      assignee,
-      team
+      state: issueDetails?.state || null,
+      assignee: issueDetails?.assignee || null,
+      team: issueDetails?.team || null
     };
   }
 
@@ -264,21 +308,53 @@ class LinearMCPClient {
   }
 
   async getIssue(issueId: string) {
-    const result = await this.rateLimiter.enqueue(() => this.client.issue(issueId));
-    if (!result) throw new Error(`Issue ${issueId} not found`);
+    // Use a single GraphQL query to fetch issue with all related data in one request
+    const query = `
+      query GetIssue($issueId: String!) {
+        issue(id: $issueId) {
+          id
+          identifier
+          title
+          description
+          priority
+          url
+          createdAt
+          updatedAt
+          state {
+            name
+          }
+          assignee {
+            name
+          }
+          team {
+            name
+          }
+        }
+      }
+    `;
 
-    const details = await this.getIssueDetails(result);
+    const result = await this.rateLimiter.enqueue(() => 
+      this.client.client.rawRequest(query, { issueId }),
+      'getIssue'
+    );
+
+    const data = result?.data as any;
+    if (!data?.issue) {
+      throw new Error(`Issue ${issueId} not found`);
+    }
+
+    const issue = data.issue;
 
     return this.addMetricsToResource({
-      id: result.id,
-      identifier: result.identifier,
-      title: result.title,
-      description: result.description,
-      priority: result.priority,
-      status: details.state?.name,
-      assignee: details.assignee?.name,
-      team: details.team?.name,
-      url: result.url
+      id: issue.id,
+      identifier: issue.identifier,
+      title: issue.title,
+      description: issue.description,
+      priority: issue.priority,
+      status: issue.state?.name,
+      assignee: issue.assignee?.name,
+      team: issue.team?.name,
+      url: issue.url
     });
   }
 
@@ -313,75 +389,259 @@ class LinearMCPClient {
   }
 
   async searchIssues(args: SearchIssuesArgs) {
-    const result = await this.rateLimiter.enqueue(() =>
-      this.client.issues({
-        filter: this.buildSearchFilter(args),
+    try {
+      console.error(`[searchIssues] Starting search with args: ${JSON.stringify(args)}`);
+      
+      // Use a single GraphQL query to fetch issues with all related data in one request
+      const query = `
+        query SearchIssues($filter: IssueFilter, $first: Int, $includeArchived: Boolean) {
+          issues(filter: $filter, first: $first, includeArchived: $includeArchived) {
+            nodes {
+              id
+              identifier
+              title
+              description
+              priority
+              estimate
+              url
+              state {
+                id
+                name
+              }
+              assignee {
+                id
+                name
+              }
+              labels {
+                nodes {
+                  id
+                  name
+                }
+              }
+            }
+          }
+        }
+      `;
+
+      const filter = this.buildSearchFilter(args);
+      console.error(`[searchIssues] Built filter: ${JSON.stringify(filter)}`);
+      
+      const variables = {
+        filter: filter,
         first: args.limit || 10,
-        includeArchived: args.includeArchived
-      })
-    );
-
-    const issuesWithDetails = await this.rateLimiter.batch(result.nodes, 5, async (issue) => {
-      const [state, assignee, labels] = await Promise.all([
-        this.rateLimiter.enqueue(() => issue.state) as Promise<WorkflowState>,
-        this.rateLimiter.enqueue(() => issue.assignee) as Promise<User>,
-        this.rateLimiter.enqueue(() => issue.labels()) as Promise<{ nodes: IssueLabel[] }>
-      ]);
-
-      return {
-        id: issue.id,
-        identifier: issue.identifier,
-        title: issue.title,
-        description: issue.description,
-        priority: issue.priority,
-        estimate: issue.estimate,
-        status: state?.name || null,
-        assignee: assignee?.name || null,
-        labels: labels?.nodes?.map((label: IssueLabel) => label.name) || [],
-        url: issue.url
+        includeArchived: args.includeArchived || false
       };
-    });
 
-    return this.addMetricsToResource(issuesWithDetails);
+      // Direct API call that we know works
+      console.error(`[searchIssues] Making direct API call with variables: ${JSON.stringify(variables)}`);
+      const result = await this.client.client.rawRequest(query, variables);
+      
+      console.error(`[searchIssues] Got response with status: ${result?.status || 'unknown'}`);
+
+      if (!result || !result.data) {
+        console.error("[searchIssues] No data in API response");
+        return [];
+      }
+
+      const data = result.data as any;
+      if (!data.issues || !data.issues.nodes) {
+        console.error("[searchIssues] No issues found in API response");
+        return [];
+      }
+
+      const issuesNodes = data.issues.nodes;
+      console.error(`[searchIssues] Found ${issuesNodes.length} issues`);
+      
+      // Map issues with additional error handling
+      const issues = [];
+      for (const issue of issuesNodes) {
+        try {
+          const mappedIssue = {
+            id: issue.id,
+            identifier: issue.identifier,
+            title: issue.title,
+            description: issue.description || '',
+            priority: issue.priority,
+            estimate: issue.estimate,
+            status: issue.state?.name || 'Unknown',
+            stateName: issue.state?.name || 'Unknown', // Add for consistency with other endpoints
+            assignee: issue.assignee?.name || null,
+            labels: issue.labels?.nodes?.map((label: any) => label.name) || [],
+            url: issue.url
+          };
+          issues.push(mappedIssue);
+        } catch (mapError) {
+          console.error(`[searchIssues] Error mapping issue: ${mapError}`);
+          console.error(`[searchIssues] Problematic issue object: ${JSON.stringify(issue)}`);
+        }
+      }
+      
+      console.error(`[searchIssues] Successfully mapped ${issues.length} issues`);
+      return issues;
+    } catch (error) {
+      console.error(`[searchIssues] Error: ${error}`);
+      if ((error as any).response) {
+        console.error(`[searchIssues] GraphQL Error:`, (error as any).response.errors);
+      }
+      return [];
+    }
   }
 
   async getUserIssues(args: GetUserIssuesArgs) {
     try {
-      const user = args.userId && typeof args.userId === 'string' ?
-        await this.rateLimiter.enqueue(() => this.client.user(args.userId as string)) :
-        await this.rateLimiter.enqueue(() => this.client.viewer);
-
-      const result = await this.rateLimiter.enqueue(() => user.assignedIssues({
-        first: args.limit || 50,
-        includeArchived: args.includeArchived
-      }));
-
-      if (!result?.nodes) {
-        return this.addMetricsToResource([]);
+      // Implementation with both viewing user's issues and specified user's issues
+      console.error(`[getUserIssues] Starting with args: ${JSON.stringify(args)}`);
+      
+      let query: string;
+      let variables: any;
+      
+      // Handle specific user vs. current viewer
+      if (args.userId && typeof args.userId === 'string') {
+        console.error(`[getUserIssues] Fetching issues for specific user: ${args.userId}`);
+        // Query for specific user's issues
+        query = `
+          query UserIssues($userId: String!, $first: Int, $includeArchived: Boolean) {
+            user(id: $userId) {
+              id
+              name
+              email
+              assignedIssues(first: $first, includeArchived: $includeArchived) {
+                nodes {
+                  id
+                  identifier
+                  title
+                  description
+                  priority
+                  url
+                  state {
+                    name
+                  }
+                }
+              }
+            }
+          }
+        `;
+        variables = {
+          userId: args.userId,
+          first: args.limit || 50,
+          includeArchived: args.includeArchived || false
+        };
+      } else {
+        console.error(`[getUserIssues] Fetching issues for current viewer`);
+        // Query for current viewer's issues
+        query = `
+          query ViewerIssues($first: Int, $includeArchived: Boolean) {
+            viewer {
+              id
+              name
+              email
+              assignedIssues(first: $first, includeArchived: $includeArchived) {
+                nodes {
+                  id
+                  identifier
+                  title
+                  description
+                  priority
+                  url
+                  state {
+                    name
+                  }
+                }
+              }
+            }
+          }
+        `;
+        variables = {
+          first: args.limit || 50,
+          includeArchived: args.includeArchived || false
+        };
       }
-
-      const issuesWithDetails = await this.rateLimiter.batch(
-        result.nodes,
-        5,
-        async (issue) => {
-          const state = await this.rateLimiter.enqueue(() => issue.state) as WorkflowState;
-          return {
+      
+      // Direct API call bypassing rate limiter (which we know works in our test)
+      console.error(`[getUserIssues] Making direct API call with query: ${query.replace(/\s+/g, ' ')}`);
+      console.error(`[getUserIssues] Variables: ${JSON.stringify(variables)}`);
+      
+      const result = await this.client.client.rawRequest(query, variables);
+      
+      console.error(`[getUserIssues] Got response with status: ${result?.status || 'unknown'}`);
+      
+      if (!result || !result.data) {
+        console.error("[getUserIssues] No data in API response");
+        return [];
+      }
+      
+      const data = result.data as any;
+      
+      // Process results based on query type
+      let issuesNodes: any[] = [];
+      let userName = "Unknown";
+      
+      if (args.userId) {
+        // For specific user query
+        if (!data.user) {
+          console.error(`[getUserIssues] No user data found for ID: ${args.userId}`);
+          return [];
+        }
+        
+        const user = data.user;
+        userName = user.name || "Unknown";
+        console.error(`[getUserIssues] Found user: ${userName} (${user.email || 'no email'})`);
+        
+        if (!user.assignedIssues || !user.assignedIssues.nodes) {
+          console.error(`[getUserIssues] No assigned issues found for user ID: ${args.userId}`);
+          return [];
+        }
+        
+        issuesNodes = user.assignedIssues.nodes;
+      } else {
+        // For viewer query
+        if (!data.viewer) {
+          console.error("[getUserIssues] No viewer in API response data");
+          return [];
+        }
+        
+        const viewer = data.viewer;
+        userName = viewer.name || "Unknown";
+        console.error(`[getUserIssues] Found viewer: ${userName} (${viewer.email || 'no email'})`);
+        
+        if (!viewer.assignedIssues || !viewer.assignedIssues.nodes) {
+          console.error("[getUserIssues] No assigned issues found for viewer");
+          return [];
+        }
+        
+        issuesNodes = viewer.assignedIssues.nodes;
+      }
+      
+      console.error(`[getUserIssues] Found ${issuesNodes.length} issues for ${args.userId ? 'user' : 'viewer'}`);
+      
+      // Map issues with additional error handling
+      const issues = [];
+      for (const issue of issuesNodes) {
+        try {
+          const mappedIssue = {
             id: issue.id,
             identifier: issue.identifier,
             title: issue.title,
-            description: issue.description,
+            description: issue.description || '',
             priority: issue.priority,
-            stateName: state?.name || 'Unknown',
+            stateName: issue.state?.name || 'Unknown',
             url: issue.url
           };
-        },
-        'getUserIssues'
-      );
-
-      return this.addMetricsToResource(issuesWithDetails);
+          issues.push(mappedIssue);
+        } catch (mapError) {
+          console.error(`[getUserIssues] Error mapping issue: ${mapError}`);
+          console.error(`[getUserIssues] Problematic issue object: ${JSON.stringify(issue)}`);
+        }
+      }
+      
+      console.error(`[getUserIssues] Successfully mapped ${issues.length} issues`);
+      return issues;
     } catch (error) {
-      console.error(`Error in getUserIssues: ${error}`);
-      throw error;
+      console.error(`[getUserIssues] Error in getUserIssues: ${error}`);
+      if ((error as any).response) {
+        console.error(`[getUserIssues] GraphQL Error:`, (error as any).response.errors);
+      }
+      return [];
     }
   }
 
@@ -404,48 +664,143 @@ class LinearMCPClient {
   }
 
   async getTeamIssues(teamId: string) {
-    const team = await this.rateLimiter.enqueue(() => this.client.team(teamId));
-    if (!team) throw new Error(`Team ${teamId} not found`);
+    try {
+      console.error(`[getTeamIssues] Starting with teamId: ${teamId}`);
+      
+      // Use a single GraphQL query to fetch team issues with all related data in one request
+      const query = `
+        query TeamIssues($teamId: ID!) {
+          team(id: $teamId) {
+            name
+            key
+            issues {
+              nodes {
+                id
+                identifier
+                title
+                description
+                priority
+                url
+                state {
+                  name
+                }
+                assignee {
+                  name
+                }
+              }
+            }
+          }
+        }
+      `;
 
-    const { nodes: issues } = await this.rateLimiter.enqueue(() => team.issues());
-
-    const issuesWithDetails = await this.rateLimiter.batch(issues, 5, async (issue) => {
-      const statePromise = issue.state;
-      const assigneePromise = issue.assignee;
-
-      const [state, assignee] = await Promise.all([
-        this.rateLimiter.enqueue(async () => statePromise ? await statePromise : null),
-        this.rateLimiter.enqueue(async () => assigneePromise ? await assigneePromise : null)
-      ]);
-
-      return {
-        id: issue.id,
-        identifier: issue.identifier,
-        title: issue.title,
-        description: issue.description,
-        priority: issue.priority,
-        status: state?.name,
-        assignee: assignee?.name,
-        url: issue.url
+      const variables = {
+        teamId: teamId
       };
-    });
 
-    return this.addMetricsToResource(issuesWithDetails);
+      // Direct API call that we know works
+      console.error(`[getTeamIssues] Making direct API call for team: ${teamId}`);
+      const result = await this.client.client.rawRequest(query, variables);
+      
+      console.error(`[getTeamIssues] Got response with status: ${result?.status || 'unknown'}`);
+
+      if (!result || !result.data) {
+        console.error("[getTeamIssues] No data in API response");
+        return [];
+      }
+
+      const data = result.data as any;
+      if (!data.team) {
+        console.error(`[getTeamIssues] No team found with ID: ${teamId}`);
+        return [];
+      }
+      
+      console.error(`[getTeamIssues] Found team: ${data.team.name} (${data.team.key})`);
+      
+      if (!data.team.issues || !data.team.issues.nodes) {
+        console.error(`[getTeamIssues] No issues found for team: ${teamId}`);
+        return [];
+      }
+
+      const issuesNodes = data.team.issues.nodes;
+      console.error(`[getTeamIssues] Found ${issuesNodes.length} issues for team`);
+      
+      // Map issues with additional error handling
+      const issues = [];
+      for (const issue of issuesNodes) {
+        try {
+          const mappedIssue = {
+            id: issue.id,
+            identifier: issue.identifier,
+            title: issue.title,
+            description: issue.description || '',
+            priority: issue.priority,
+            status: issue.state?.name || 'Unknown',
+            stateName: issue.state?.name || 'Unknown', // Add for consistency with other endpoints
+            assignee: issue.assignee?.name || null,
+            url: issue.url
+          };
+          issues.push(mappedIssue);
+        } catch (mapError) {
+          console.error(`[getTeamIssues] Error mapping issue: ${mapError}`);
+          console.error(`[getTeamIssues] Problematic issue object: ${JSON.stringify(issue)}`);
+        }
+      }
+      
+      console.error(`[getTeamIssues] Successfully mapped ${issues.length} issues`);
+      return issues;
+    } catch (error) {
+      console.error(`[getTeamIssues] Error: ${error}`);
+      if ((error as any).response) {
+        console.error(`[getTeamIssues] GraphQL Error:`, (error as any).response.errors);
+      }
+      return [];
+    }
   }
 
   async getViewer() {
-    const viewer = await this.client.viewer;
-    const [teams, organization] = await Promise.all([
-      viewer.teams(),
-      this.client.organization
-    ]);
+    // Use a single GraphQL query to fetch viewer data with teams and organization in one request
+    const query = `
+      query ViewerData {
+        viewer {
+          id
+          name
+          email
+          admin
+          teams {
+            nodes {
+              id
+              name
+              key
+            }
+          }
+        }
+        organization {
+          id
+          name
+          urlKey
+        }
+      }
+    `;
+
+    const result = await this.rateLimiter.enqueue(() => 
+      this.client.client.rawRequest(query, {}),
+      'getViewer'
+    );
+
+    const data = result?.data as any;
+    if (!data?.viewer) {
+      throw new Error("Failed to fetch viewer data");
+    }
+
+    const viewer = data.viewer;
+    const organization = data.organization;
 
     return this.addMetricsToResource({
       id: viewer.id,
       name: viewer.name,
       email: viewer.email,
       admin: viewer.admin,
-      teams: teams.nodes.map(team => ({
+      teams: viewer.teams.nodes.map((team: any) => ({
         id: team.id,
         name: team.name,
         key: team.key
@@ -458,23 +813,60 @@ class LinearMCPClient {
     });
   }
 
-  async getOrganization() {
-    const organization = await this.client.organization;
-    const [teams, users] = await Promise.all([
-      organization.teams(),
-      organization.users()
-    ]);
+  async getOrganization(): Promise<OrganizationResponse> {
+    // Use a single GraphQL query to fetch organization data with teams and users in one request
+    const query = `
+      query OrganizationData {
+        organization {
+          id
+          name
+          urlKey
+          teams {
+            nodes {
+              id
+              name
+              key
+              description
+              archivedAt
+            }
+          }
+          users {
+            nodes {
+              id
+              name
+              email
+              admin
+              active
+            }
+          }
+        }
+      }
+    `;
+
+    const result = await this.rateLimiter.enqueue(() => 
+      this.client.client.rawRequest(query, {}),
+      'getOrganization'
+    );
+
+    const data = result?.data as any;
+    if (!data?.organization) {
+      throw new Error("Failed to fetch organization data");
+    }
+
+    const organization = data.organization;
 
     return this.addMetricsToResource({
       id: organization.id,
       name: organization.name,
       urlKey: organization.urlKey,
-      teams: teams.nodes.map(team => ({
+      teams: organization.teams.nodes.map((team: any) => ({
         id: team.id,
         name: team.name,
-        key: team.key
+        key: team.key,
+        description: team.description || undefined,
+        active: !team.archivedAt
       })),
-      users: users.nodes.map(user => ({
+      users: organization.users.nodes.map((user: any) => ({
         id: user.id,
         name: user.name,
         email: user.email,
@@ -483,15 +875,92 @@ class LinearMCPClient {
       }))
     });
   }
+  
+  async getTeams(args: GetTeamsArgs = {}) {
+    try {
+      console.error(`[getTeams] Starting with args: ${JSON.stringify(args)}`);
+      
+      // Use a single GraphQL query to fetch all teams with their details in one request
+      const query = `
+        query GetTeams($includeArchived: Boolean) {
+          teams(includeArchived: $includeArchived) {
+            nodes {
+              id
+              name
+              key
+              description
+              archivedAt
+            }
+          }
+        }
+      `;
 
+      const variables = {
+        includeArchived: args.includeArchived || false
+      };
+
+      // Direct API call with good error handling
+      console.error(`[getTeams] Making direct API call with variables: ${JSON.stringify(variables)}`);
+      const result = await this.client.client.rawRequest(query, variables);
+      
+      console.error(`[getTeams] Got response with status: ${result?.status || 'unknown'}`);
+
+      if (!result || !result.data) {
+        console.error("[getTeams] No data in API response");
+        return [];
+      }
+
+      const data = result.data as any;
+      if (!data.teams || !data.teams.nodes) {
+        console.error("[getTeams] No teams found in API response");
+        return [];
+      }
+
+      const teamsNodes = data.teams.nodes;
+      console.error(`[getTeams] Found ${teamsNodes.length} teams`);
+      
+      // Map teams with additional error handling
+      const teams = [];
+      for (const team of teamsNodes) {
+        try {
+          const mappedTeam = {
+            id: team.id,
+            name: team.name,
+            key: team.key,
+            description: team.description || '',
+            active: !team.archivedAt
+          };
+          teams.push(mappedTeam);
+        } catch (mapError) {
+          console.error(`[getTeams] Error mapping team: ${mapError}`);
+          console.error(`[getTeams] Problematic team object: ${JSON.stringify(team)}`);
+        }
+      }
+      
+      console.error(`[getTeams] Successfully mapped ${teams.length} teams`);
+      return teams;
+    } catch (error) {
+      console.error(`[getTeams] Error: ${error}`);
+      if ((error as any).response) {
+        console.error(`[getTeams] GraphQL Error:`, (error as any).response.errors);
+      }
+      return [];
+    }
+  }
+  
   private buildSearchFilter(args: SearchIssuesArgs): any {
     const filter: any = {};
 
     if (args.query) {
-      filter.or = [
-        { title: { contains: args.query } },
-        { description: { contains: args.query } }
-      ];
+      // Check if query looks like an issue identifier (e.g., SYM-1622)
+      if (/^[A-Z]+-\d+$/.test(args.query)) {
+        filter.identifier = { eq: args.query };
+      } else {
+        filter.or = [
+          { title: { contains: args.query } },
+          { description: { contains: args.query } }
+        ];
+      }
     }
 
     if (args.teamId) {
@@ -528,15 +997,15 @@ class LinearMCPClient {
 
 const createIssueTool: Tool = {
   name: "linear_create_issue",
-  description: "Creates a new Linear issue with specified details. Use this to create tickets for tasks, bugs, or feature requests. Returns the created issue's identifier and URL. Required fields are title and teamId, with optional description, priority (0-4, where 0 is no priority and 1 is urgent), and status.",
+  description: "Creates a new Linear issue with specified details. Use this to create tickets for tasks, bugs, or feature requests. Returns the created issue's identifier and URL. Required fields are title and teamId, with optional description, priority (0-4, where 0 is no priority and 1 is urgent), and status. Example: {\"title\": \"Fix login bug\", \"teamId\": \"5a656ab6-af57-4895-bd34-99855115bb1b\", \"priority\": 2}",
   inputSchema: {
     type: "object",
     properties: {
       title: { type: "string", description: "Issue title" },
-      teamId: { type: "string", description: "Team ID" },
+      teamId: { type: "string", description: "Team ID (get this from linear_get_organization first)" },
       description: { type: "string", description: "Issue description" },
-      priority: { type: "number", description: "Priority (0-4)" },
-      status: { type: "string", description: "Issue status" }
+      priority: { type: "number", description: "Priority (0=none, 1=urgent, 2=high, 3=normal, 4=low)" },
+      status: { type: "string", description: "Issue status (must match exact workflow state name)" }
     },
     required: ["title", "teamId"]
   }
@@ -544,15 +1013,15 @@ const createIssueTool: Tool = {
 
 const updateIssueTool: Tool = {
   name: "linear_update_issue",
-  description: "Updates an existing Linear issue's properties. Use this to modify issue details like title, description, priority, or status. Requires the issue ID and accepts any combination of updatable fields. Returns the updated issue's identifier and URL.",
+  description: "Updates an existing Linear issue's properties. Use this to modify issue details like title, description, priority, or status. Requires the issue ID and accepts any combination of updatable fields. Returns the updated issue's identifier and URL. Example: {\"id\": \"issue-id-here\", \"status\": \"In Progress\"}",
   inputSchema: {
     type: "object",
     properties: {
-      id: { type: "string", description: "Issue ID" },
+      id: { type: "string", description: "Issue ID (get this from search_issues or linear-issue:/// resources)" },
       title: { type: "string", description: "New title" },
       description: { type: "string", description: "New description" },
-      priority: { type: "number", description: "New priority (0-4)" },
-      status: { type: "string", description: "New status" }
+      priority: { type: "number", description: "New priority (0=none, 1=urgent, 2=high, 3=normal, 4=low)" },
+      status: { type: "string", description: "New status (must match exact workflow state name)" }
     },
     required: ["id"]
   }
@@ -560,18 +1029,18 @@ const updateIssueTool: Tool = {
 
 const searchIssuesTool: Tool = {
   name: "linear_search_issues",
-  description: "Searches Linear issues using flexible criteria. Supports filtering by any combination of: title/description text, team, status, assignee, labels, priority (1=urgent, 2=high, 3=normal, 4=low), and estimate. Returns up to 10 issues by default (configurable via limit).",
+  description: "Searches Linear issues using flexible criteria. Supports filtering by any combination of: title/description text, team, status, assignee, labels, priority (1=urgent, 2=high, 3=normal, 4=low), and estimate. Returns up to 10 issues by default (configurable via limit). Example: {\"query\": \"login\", \"teamId\": \"team-id\", \"limit\": 20}",
   inputSchema: {
     type: "object",
     properties: {
       query: { type: "string", description: "Optional text to search in title and description" },
-      teamId: { type: "string", description: "Filter by team ID" },
+      teamId: { type: "string", description: "Filter by team ID (get this from linear_get_organization first)" },
       status: { type: "string", description: "Filter by status name (e.g., 'In Progress', 'Done')" },
-      assigneeId: { type: "string", description: "Filter by assignee's user ID" },
+      assigneeId: { type: "string", description: "Filter by assignee's user ID (get this from linear_get_organization first)" },
       labels: {
         type: "array",
         items: { type: "string" },
-        description: "Filter by label names"
+        description: "Filter by label names (e.g. [\"bug\", \"feature\"])"
       },
       priority: {
         type: "number",
@@ -595,11 +1064,11 @@ const searchIssuesTool: Tool = {
 
 const getUserIssuesTool: Tool = {
   name: "linear_get_user_issues",
-  description: "Retrieves issues assigned to a specific user or the authenticated user if no userId is provided. Returns issues sorted by last updated, including priority, status, and other metadata. Useful for finding a user's workload or tracking assigned tasks.",
+  description: "Retrieves issues assigned to a specific user or the authenticated user if no userId is provided. Returns issues sorted by last updated, including priority, status, and other metadata. Useful for finding a user's workload or tracking assigned tasks. Example: {\"userId\": \"d0bc778f-c97d-4450-a464-7282854e8801\"}",
   inputSchema: {
     type: "object",
     properties: {
-      userId: { type: "string", description: "Optional user ID. If not provided, returns authenticated user's issues" },
+      userId: { type: "string", description: "Optional user ID (get this from linear_get_organization first). If not provided, returns authenticated user's issues" },
       includeArchived: { type: "boolean", description: "Include archived issues in results" },
       limit: { type: "number", description: "Maximum number of issues to return (default: 50)" }
     }
@@ -608,11 +1077,11 @@ const getUserIssuesTool: Tool = {
 
 const addCommentTool: Tool = {
   name: "linear_add_comment",
-  description: "Adds a comment to an existing Linear issue. Supports markdown formatting in the comment body. Can optionally specify a custom user name and avatar for the comment. Returns the created comment's details including its URL.",
+  description: "Adds a comment to an existing Linear issue. Supports markdown formatting in the comment body. Can optionally specify a custom user name and avatar for the comment. Returns the created comment's details including its URL. Example: {\"issueId\": \"issue-id\", \"body\": \"Added fix for this issue\"}",
   inputSchema: {
     type: "object",
     properties: {
-      issueId: { type: "string", description: "ID of the issue to comment on" },
+      issueId: { type: "string", description: "ID of the issue to comment on (get this from search_issues or linear-issue:/// resources)" },
       body: { type: "string", description: "Comment text in markdown format" },
       createAsUser: { type: "string", description: "Optional custom username to show for the comment" },
       displayIconUrl: { type: "string", description: "Optional avatar URL for the comment" }
@@ -621,11 +1090,44 @@ const addCommentTool: Tool = {
   }
 };
 
+const getTeamsTool: Tool = {
+  name: "linear_get_teams",
+  description: "Fetches all teams in the organization. Returns team details including ID, name, key, description, and status. Use this to get team information for creating issues or filtering searches. This should typically be called first to get team IDs. Example: {\"includeArchived\": true}",
+  inputSchema: {
+    type: "object",
+    properties: {
+      includeArchived: { type: "boolean", description: "Include archived teams in results (default: false)" }
+    }
+  }
+};
+
+const getOrganizationTool: Tool = {
+  name: "linear_get_organization",
+  description: "Fetches information about the current organization associated with your Linear API key. Returns organization details, teams, and users. This is the first tool you should call to get team IDs and user IDs needed for other operations. Example: {}",
+  inputSchema: {
+    type: "object",
+    properties: {}
+  }
+};
+
+const getIssueDetailsTool: Tool = {
+  name: "linear_get_issue_details",
+  description: "Fetches detailed information about a specific Linear issue including its title, description, status, assignee, comments, and history. Works with either issue reference codes (SYM-839) or internal IDs. Example: {\"issueId\": \"SYM-839\"}",
+  inputSchema: {
+    type: "object",
+    properties: {
+      issueId: { type: "string", description: "The issue reference code (e.g., SYM-839) or internal ID" }
+    },
+    required: ["issueId"]
+  }
+};
+
+
 const resourceTemplates: ResourceTemplate[] = [
   {
     uriTemplate: "linear-issue:///{issueId}",
     name: "Linear Issue",
-    description: "A Linear issue with its details, comments, and metadata. Use this to fetch detailed information about a specific issue.",
+    description: "A Linear issue with its details, comments, and metadata. Use this to fetch detailed information about a specific issue. First use linear_search_issues to find the issue ID.",
     parameters: {
       issueId: {
         type: "string",
@@ -639,7 +1141,7 @@ const resourceTemplates: ResourceTemplate[] = [
   {
     uriTemplate: "linear-viewer:",
     name: "Current User",
-    description: "Information about the authenticated user associated with the API key, including their role, teams, and settings.",
+    description: "Information about the authenticated user associated with the API key, including their role, teams, and settings. No parameters needed.",
     parameters: {},
     examples: [
       "linear-viewer:"
@@ -648,7 +1150,7 @@ const resourceTemplates: ResourceTemplate[] = [
   {
     uriTemplate: "linear-organization:",
     name: "Current Organization",
-    description: "Details about the Linear organization associated with the API key, including settings, teams, and members.",
+    description: "Details about the Linear organization associated with the API key, including settings, teams, and members. Use this to get team IDs and user IDs needed for other queries. No parameters needed.",
     parameters: {},
     examples: [
       "linear-organization:"
@@ -657,11 +1159,11 @@ const resourceTemplates: ResourceTemplate[] = [
   {
     uriTemplate: "linear-team:///{teamId}/issues",
     name: "Team Issues",
-    description: "All active issues belonging to a specific Linear team, including their status, priority, and assignees.",
+    description: "All active issues belonging to a specific Linear team, including their status, priority, and assignees. Get the teamId from linear_get_organization.",
     parameters: {
       teamId: {
         type: "string",
-        description: "The unique identifier of the Linear team (found in team settings)"
+        description: "The unique identifier of the Linear team (found via linear_get_organization)"
       }
     },
     examples: [
@@ -671,11 +1173,11 @@ const resourceTemplates: ResourceTemplate[] = [
   {
     uriTemplate: "linear-user:///{userId}/assigned",
     name: "User Assigned Issues",
-    description: "Active issues assigned to a specific Linear user. Returns issues sorted by update date.",
+    description: "Active issues assigned to a specific Linear user. Returns issues sorted by update date. Get the userId from linear_get_organization.",
     parameters: {
       userId: {
         type: "string",
-        description: "The unique identifier of the Linear user. Use 'me' for the authenticated user"
+        description: "The unique identifier of the Linear user (found via linear_get_organization). Use 'me' for the authenticated user"
       }
     },
     examples: [
@@ -697,60 +1199,110 @@ Key capabilities:
 - Issue tracking: Add comments and track progress through status updates and assignments.
 - Organization overview: View team structures and user assignments across the organization.
 
-Tool Usage:
-- linear_create_issue:
-  - use teamId from linear-organization: resource
-  - priority levels: 1=urgent, 2=high, 3=normal, 4=low
-  - status must match exact Linear workflow state names (e.g., "In Progress", "Done")
+## Available Tools and Query Format
 
-- linear_update_issue:
-  - get issue IDs from search_issues or linear-issue:/// resources
-  - only include fields you want to change
-  - status changes must use valid state IDs from the team's workflow
+1. **linear_get_organization**
+   - Get organization data, teams, and users - CALL THIS FIRST
+   - No parameters required
+   - Example: \`{}\`
 
-- linear_search_issues:
-  - combine multiple filters for precise results
-  - use labels array for multiple tag filtering
-  - query searches both title and description
-  - returns max 10 results by default
+2. **linear_get_teams**
+   - Returns team details (ID, name, key, description)
+   - Optional: \`includeArchived\` (boolean)
+   - Example: \`{"includeArchived": true}\`
 
-- linear_get_user_issues:
-  - omit userId to get authenticated user's issues
-  - useful for workload analysis and sprint planning
-  - returns most recently updated issues first
+3. **linear_create_issue**
+   - Required: \`title\`, \`teamId\`
+   - Optional: \`description\`, \`priority\` (0-4), \`status\`
+   - Priority levels: 0=none, 1=urgent, 2=high, 3=normal, 4=low
+   - Example: \`{"title": "Fix login bug", "teamId": "5a656ab6-af57-4895-bd34-99855115bb1b", "priority": 2}\`
 
-- linear_add_comment:
-  - supports full markdown formatting
-  - use displayIconUrl for bot/integration avatars
-  - createAsUser for custom comment attribution
+4. **linear_update_issue**
+   - Required: \`id\`
+   - Optional: \`title\`, \`description\`, \`priority\`, \`status\`
+   - Example: \`{"id": "issue-id-here", "status": "In Progress"}\`
 
-Best practices:
-- When creating issues:
-  - Write clear, actionable titles that describe the task well (e.g., "Implement user authentication for mobile app")
-  - Include concise but appropriately detailed descriptions in markdown format with context and acceptance criteria
-  - Set appropriate priority based on the context (1=critical to 4=nice-to-have)
-  - Always specify the correct team ID (default to the user's team if possible)
+5. **linear_search_issues**
+   - All parameters optional:
+   - \`query\`: Text search in title/description
+   - \`teamId\`: Filter by team
+   - \`assigneeId\`: Filter by assignee's user ID
+   - \`status\`: Filter by status name
+   - \`labels\`: Array of label names
+   - \`priority\`: Filter by priority level (1=urgent to 4=low)
+   - \`estimate\`: Filter by points estimate
+   - \`includeArchived\`: Include archived issues (default: false)
+   - \`limit\`: Max results to return (default: 10)
+   - Example: \`{"query": "login", "teamId": "team-id", "limit": 20}\`
 
-- When searching:
-  - Use specific, targeted queries for better results (e.g., "auth mobile app" rather than just "auth")
-  - Apply relevant filters when asked or when you can infer the appropriate filters to narrow results
+6. **linear_get_user_issues**
+   - Optional parameters:
+   - \`userId\`: User ID (omit for authenticated user)
+   - \`includeArchived\`: Include archived issues
+   - \`limit\`: Max results (default: 50)
+   - Example: \`{"userId": "d0bc778f-c97d-4450-a464-7282854e8801"}\`
 
-- When adding comments:
-  - Use markdown formatting to improve readability and structure
-  - Keep content focused on the specific issue and relevant updates
-  - Include action items or next steps when appropriate
+7. **linear_add_comment**
+   - Required: \`issueId\`, \`body\`
+   - Optional: \`createAsUser\`, \`displayIconUrl\`
+   - Example: \`{"issueId": "issue-id", "body": "Added fix for this issue"}\`
 
-- General best practices:
-  - Fetch organization data first to get valid team IDs
-  - Use search_issues to find issues for bulk operations
-  - Include markdown formatting in descriptions and comments
+## Best Practices for Querying
 
-Resource patterns:
-- linear-issue:///{issueId} - Single issue details (e.g., linear-issue:///c2b318fb-95d2-4a81-9539-f3268f34af87)
-- linear-team:///{teamId}/issues - Team's issue list (e.g., linear-team:///OPS/issues)
-- linear-user:///{userId}/assigned - User assignments (e.g., linear-user:///USER-123/assigned)
-- linear-organization: - Organization for the current user
-- linear-viewer: - Current user context
+1. **Find user/team information first**:
+   - Always start with \`linear_get_organization\` to get all user IDs and team IDs
+   - These IDs are required for creating issues or filtering searches
+
+2. **Search efficiently**:
+   - Combine multiple filters for precise results
+   - Use specific search terms in the \`query\` parameter
+   - For user issues, use their ID from organization data
+
+3. **Understand priority levels**:
+   - 0 = No priority
+   - 1 = Urgent
+   - 2 = High
+   - 3 = Normal
+   - 4 = Low
+
+4. **Resource URIs**:
+   - \`linear-issue:///{issueId}\` - Get a specific issue
+   - \`linear-team:///{teamId}/issues\` - Get team issues
+   - \`linear-user:///{userId}/assigned\` - Get user assignments
+   - \`linear-organization:\` - Get organization info
+   - \`linear-viewer:\` - Get current user context
+
+5. **Rate limits**:
+   - Server handles 1400 requests per hour
+   - Responses include API metrics (requests used, remaining)
+
+
+## Example Workflow
+
+1. First, get organization info to find teams and users:
+   \`\`\`
+   linear_get_organization {}
+   \`\`\`
+
+2. Then create an issue using a team ID from the response:
+   \`\`\`
+   linear_create_issue {"title": "Implement login feature", "teamId": "5a656ab6-af57-4895-bd34-99855115bb1b", "priority": 2}
+   \`\`\`
+
+3. Search for issues related to a specific topic:
+   \`\`\`
+   linear_search_issues {"query": "login", "teamId": "5a656ab6-af57-4895-bd34-99855115bb1b"}
+   \`\`\`
+
+4. Get issues assigned to a specific user:
+   \`\`\`
+   linear_get_user_issues {"userId": "d0bc778f-c97d-4450-a464-7282854e8801"}
+   \`\`\`
+
+5. Add a comment to an issue:
+   \`\`\`
+   linear_add_comment {"issueId": "issue-id-here", "body": "This is fixed in the latest release"}
+   \`\`\`
 
 The server uses the authenticated user's permissions for all operations.`
 };
@@ -796,6 +1348,15 @@ const AddCommentArgsSchema = z.object({
   createAsUser: z.string().optional().describe("Optional custom username to show for the comment"),
   displayIconUrl: z.string().optional().describe("Optional avatar URL for the comment")
 });
+
+const GetTeamsArgsSchema = z.object({
+  includeArchived: z.boolean().optional().describe("Include archived teams in results")
+});
+
+const GetIssueDetailsArgsSchema = z.object({
+  issueId: z.string().describe("The issue reference code (e.g., SYM-839) or internal ID")
+});
+
 
 async function main() {
   try {
@@ -900,7 +1461,16 @@ async function main() {
     });
 
     server.setRequestHandler(ListToolsRequestSchema, async () => ({
-      tools: [createIssueTool, updateIssueTool, searchIssuesTool, getUserIssuesTool, addCommentTool]
+      tools: [
+        createIssueTool, 
+        updateIssueTool, 
+        searchIssuesTool, 
+        getUserIssuesTool, 
+        addCommentTool, 
+        getTeamsTool, 
+        getOrganizationTool,
+        getIssueDetailsTool
+      ]
     }));
 
     server.setRequestHandler(ListResourceTemplatesRequestSchema, async () => {
@@ -925,6 +1495,12 @@ async function main() {
     });
 
     server.setRequestHandler(CallToolRequestSchema, async (request: CallToolRequest) => {
+      // IMPORTANT DEBUG STATEMENT - log every tool call
+      console.error("\n========== TOOL CALL ==========");
+      console.error("Tool:", request.params.name);
+      console.error("Args:", JSON.stringify(request.params.arguments));
+      console.error("==============================\n");
+
       let metrics: RateLimiterMetrics = {
         totalRequests: 0,
         requestsInLastHour: 0,
@@ -932,6 +1508,8 @@ async function main() {
         queueLength: 0,
         lastRequestTime: Date.now()
       };
+
+      // We'll keep the standard flow for all tools now that we've fixed the implementation
 
       try {
         const { name, arguments: args } = request.params;
@@ -968,36 +1546,111 @@ async function main() {
 
           case "linear_search_issues": {
             const validatedArgs = SearchIssuesArgsSchema.parse(args);
-            const issues = await linearClient.searchIssues(validatedArgs);
-            const metricsText = linearClient.getMetricsText();
-            
-            return {
-              content: [{
-                type: "text",
-                text: `Found ${issues.length} issues:\n${
-                  issues.map((issue: LinearIssueResponse) =>
-                    `- ${issue.identifier}: ${issue.title}\n  Priority: ${issue.priority || 'None'}\n  Status: ${issue.status || 'None'}\n  ${issue.url}`
-                  ).join('\n')
-                }${metricsText}`
-              }]
-            };
+            try {
+              console.error("[Handler] Calling searchIssues with args:", JSON.stringify(validatedArgs));
+              const issues = await linearClient.searchIssues(validatedArgs);
+              console.error(`[Handler] Got response with ${Array.isArray(issues) ? issues.length : 0} issues`);
+              
+              if (Array.isArray(issues) && issues.length > 0) {
+                console.error(`[Handler] First issue: ${JSON.stringify(issues[0])}`);
+              }
+              
+              const metricsText = linearClient.getMetricsText();
+              
+              // Format issues for display
+              let issuesText = '';
+              if (Array.isArray(issues) && issues.length > 0) {
+                issuesText = '\n' + issues.map((issue: any) => {
+                  // Format any labels if they exist
+                  const labelsText = issue.labels && issue.labels.length > 0 
+                    ? `\n  Labels: ${issue.labels.join(', ')}` 
+                    : '';
+                    
+                  // Format assignee if it exists  
+                  const assigneeText = issue.assignee 
+                    ? `\n  Assignee: ${issue.assignee}` 
+                    : '';
+                    
+                  return `- ${issue.identifier}: ${issue.title}
+  Priority: ${issue.priority || 'None'}
+  Status: ${issue.stateName || issue.status || 'Unknown'}${assigneeText}${labelsText}
+  ${issue.url}`;
+                }).join('\n');
+                
+                console.error(`[Handler] Formatted ${issues.length} issues for display`);
+                return {
+                  content: [{
+                    type: "text",
+                    text: `Found ${issues.length} issues:${issuesText}${metricsText}`
+                  }]
+                };
+              } else {
+                console.error("[Handler] No issues found or invalid response format");
+                return {
+                  content: [{
+                    type: "text",
+                    text: `Found 0 issues:${metricsText}`
+                  }]
+                };
+              }
+            } catch (error) {
+              console.error(`[Handler] Error in search_issues handler: ${error}`);
+              const metricsText = linearClient.getMetricsText();
+              return {
+                content: [{
+                  type: "text",
+                  text: `Error searching issues: ${error instanceof Error ? error.message : String(error)}${metricsText}`
+                }]
+              };
+            }
           }
 
           case "linear_get_user_issues": {
             const validatedArgs = GetUserIssuesArgsSchema.parse(args);
-            const issues = await linearClient.getUserIssues(validatedArgs);
-            const metricsText = linearClient.getMetricsText();
-
-            return {
-              content: [{
-                type: "text",
-                text: `Found ${issues.length} issues:\n${
-                  issues.map((issue: LinearIssueResponse) =>
-                    `- ${issue.identifier}: ${issue.title}\n  Priority: ${issue.priority || 'None'}\n  Status: ${issue.stateName}\n  ${issue.url}`
-                  ).join('\n')
-                }${metricsText}`
-              }]
-            };
+            try {
+              console.error("[Handler] Calling getUserIssues with args:", JSON.stringify(validatedArgs));
+              const issues = await linearClient.getUserIssues(validatedArgs);
+              console.error(`[Handler] Got response with ${Array.isArray(issues) ? issues.length : 0} issues`);
+              
+              if (Array.isArray(issues) && issues.length > 0) {
+                console.error(`[Handler] First issue: ${JSON.stringify(issues[0])}`);
+              }
+              
+              const metricsText = linearClient.getMetricsText();
+              
+              // Format issues for display
+              let issuesText = '';
+              if (Array.isArray(issues) && issues.length > 0) {
+                issuesText = '\n' + issues.map((issue: any) => 
+                  `- ${issue.identifier}: ${issue.title}\n  Priority: ${issue.priority || 'None'}\n  Status: ${issue.stateName || 'Unknown'}\n  ${issue.url}`
+                ).join('\n');
+                
+                console.error(`[Handler] Formatted ${issues.length} issues for display`);
+                return {
+                  content: [{
+                    type: "text",
+                    text: `Found ${issues.length} issues:${issuesText}${metricsText}`
+                  }]
+                };
+              } else {
+                console.error("[Handler] No issues found or invalid response format");
+                return {
+                  content: [{
+                    type: "text",
+                    text: `Found 0 issues:${metricsText}`
+                  }]
+                };
+              }
+            } catch (error) {
+              console.error(`[Handler] Error in get_user_issues handler: ${error}`);
+              const metricsText = linearClient.getMetricsText();
+              return {
+                content: [{
+                  type: "text",
+                  text: `Error retrieving user issues: ${error instanceof Error ? error.message : String(error)}${metricsText}`
+                }]
+              };
+            }
           }
 
           case "linear_add_comment": {
@@ -1011,6 +1664,167 @@ async function main() {
                 text: `Added comment to issue ${issue?.identifier}\nURL: ${comment.url}${metricsText}`
               }]
             };
+          }
+          
+          case "linear_get_teams": {
+            const validatedArgs = GetTeamsArgsSchema.parse(args);
+            try {
+              console.error("[Handler] Calling getTeams with args:", JSON.stringify(validatedArgs));
+              const teams = await linearClient.getTeams(validatedArgs);
+              console.error(`[Handler] Got response with ${Array.isArray(teams) ? teams.length : 0} teams`);
+              
+              const metricsText = linearClient.getMetricsText();
+              
+              // Format teams for display if we got a valid response
+              if (Array.isArray(teams) && teams.length > 0) {
+                const teamsText = teams.map((team: TeamResponse) => 
+                  `- ${team.key}: ${team.name} (ID: ${team.id})\n  ${team.description || ""}\n  Status: ${team.active ? 'Active' : 'Archived'}`
+                ).join('\n');
+                
+                const teamIdsText = teams.map((team: TeamResponse) => 
+                  `- ${team.name}: ${team.id}`
+                ).join('\n');
+                
+                console.error(`[Handler] Successfully formatted ${teams.length} teams`);
+                return {
+                  content: [{
+                    type: "text",
+                    text: `Found ${teams.length} teams:\n${teamsText}\n\nTeam IDs for reference:\n${teamIdsText}${metricsText}`
+                  }]
+                };
+              } else {
+                console.error("[Handler] No teams found or invalid response format");
+                return {
+                  content: [{
+                    type: "text",
+                    text: `Found 0 teams${metricsText}`
+                  }]
+                };
+              }
+            } catch (error) {
+              console.error(`[Handler] Error in get_teams handler:`, error);
+              const metricsText = linearClient.getMetricsText();
+              return {
+                content: [{
+                  type: "text",
+                  text: `Error retrieving teams: ${error instanceof Error ? error.message : String(error)}${metricsText}`
+                }]
+              };
+            }
+          }
+          
+          case "linear_get_organization": {
+            const organization = await linearClient.getOrganization();
+            const metricsText = linearClient.getMetricsText();
+            
+            return {
+              content: [{
+                type: "text",
+                text: `Organization: ${organization.name} (${organization.urlKey})\n\nTeams: ${organization.teams.length}\n${
+                  organization.teams.map((team: TeamResponse) => 
+                    `- ${team.key}: ${team.name} (ID: ${team.id})`
+                  ).join('\n')
+                }\n\nTeam IDs for reference:\n${
+                  organization.teams.map((team: TeamResponse) => 
+                    `- ${team.name}: ${team.id}`
+                  ).join('\n')
+                }\n\nUsers: ${organization.users.length}\n${
+                  organization.users.map((user: UserResponse) => 
+                    `- ${user.name} (${user.email}) (ID: ${user.id}) ${user.admin ? '[Admin]' : ''} ${user.active ? '' : '[Inactive]'}`
+                  ).join('\n')
+                }\n\nUser IDs for reference:\n${
+                  organization.users.map((user: UserResponse) => 
+                    `- ${user.name}: ${user.id}`
+                  ).join('\n')
+                }${metricsText}`
+              }]
+            };
+          }
+          
+          
+          case "linear_get_issue_details": {
+            // Schema validation
+            if (!args.issueId || typeof args.issueId !== 'string') {
+              return {
+                content: [{
+                  type: "text",
+                  text: "Error: issueId is required and must be a string"
+                }]
+              };
+            }
+            
+            try {
+              console.error(`[Handler] Calling getIssue with ID: ${args.issueId}`);
+              const issue = await linearClient.getIssue(args.issueId);
+              console.error(`[Handler] Got issue: ${issue ? `${issue.identifier} - ${issue.title}` : 'not found'}`);
+              
+              const metricsText = linearClient.getMetricsText();
+              
+              if (issue) {
+                // Format the issue details nicely
+                let commentsText = '';
+                if (issue.comments && issue.comments.length > 0) {
+                  commentsText = '\n\n## Comments\n' + issue.comments.map((comment: {userName: string, createdAt: string, body: string}) => 
+                    `- ${comment.userName} (${comment.createdAt ? new Date(comment.createdAt).toLocaleString() : 'Unknown'}):\n  ${comment.body.replace(/\n/g, '\n  ')}`
+                  ).join('\n\n');
+                }
+                
+                // Format labels
+                let labelsText = '';
+                if (issue.labels && issue.labels.length > 0) {
+                  labelsText = '\nLabels: ' + issue.labels.map((label: {name: string}) => label.name).join(', ');
+                }
+                
+                // Format history (simplified)
+                let historyText = '';
+                if (issue.history && issue.history.length > 0) {
+                  historyText = '\n\n## Recent Activity\n' + issue.history
+                    .slice(0, 5) // Show only the 5 most recent events
+                    .map((event: {type: string, fromState?: string, toState?: string, actor: string, createdAt: string}) => {
+                      if (event.type === 'state' && event.fromState && event.toState) {
+                        return `- ${event.actor} changed status from "${event.fromState}" to "${event.toState}" (${event.createdAt ? new Date(event.createdAt).toLocaleString() : 'Unknown'})`;
+                      } else {
+                        return `- ${event.actor} ${event.type} (${event.createdAt ? new Date(event.createdAt).toLocaleString() : 'Unknown'})`;
+                      }
+                    }).join('\n');
+                }
+                
+                return {
+                  content: [{
+                    type: "text",
+                    text: `# ${issue.identifier}: ${issue.title}
+
+## Details
+- Status: ${issue.stateName} (${issue.stateType})
+- Priority: ${issue.priority || 'None'}
+- Team: ${issue.teamName || 'None'} (${issue.teamKey || ''})
+- Assignee: ${issue.assignee || 'Unassigned'}${labelsText}
+- Created: ${issue.createdAt ? new Date(issue.createdAt).toLocaleString() : 'Unknown'}
+- Updated: ${issue.updatedAt ? new Date(issue.updatedAt).toLocaleString() : 'Unknown'}
+- URL: ${issue.url}
+
+## Description
+${issue.description || 'No description provided.'}${commentsText}${historyText}${metricsText}`
+                  }]
+                };
+              } else {
+                return {
+                  content: [{
+                    type: "text",
+                    text: `No issue found with ID: ${args.issueId}${metricsText}`
+                  }]
+                };
+              }
+            } catch (error) {
+              console.error(`[Handler] Error in get_issue_details handler:`, error);
+              const metricsText = linearClient.getMetricsText();
+              return {
+                content: [{
+                  type: "text",
+                  text: `Error retrieving issue details: ${error instanceof Error ? error.message : String(error)}${metricsText}`
+                }]
+              };
+            }
           }
 
           default:
